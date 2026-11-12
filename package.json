@@ -1,0 +1,20 @@
+{
+  "name": "seokart-common",
+  "version": "0.1.0",
+  "description": "Shared Sequelize models, utils, and BullMQ queue constants for seokart backend + worker",
+  "license": "ISC",
+  "author": "Activant Solution Pvt Ltd",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "models",
+    "utils",
+    "queues"
+  ],
+  "peerDependencies": {
+    "sequelize": "^6.37.8",
+    "mysql2": "^3.24.6",
+    "axios": "^1.20.0",
+    "sharp": "^0.35.5"
+  }
+}
