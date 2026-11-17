@@ -34,20 +34,30 @@ const ITEM_JOBS = [
  * BullMQ ids cannot contain ':'.
  *
  * @param {string} type - AUDIT_JOB value
- * @param {{ storeHash: string, channelId?: number, itemType?: string, auditIds?: number[] }} data
+ * Scrape jobs are one chain per store (a Redis key in the worker stops a second chain), so each
+ * batch only needs a unique id: `queuedAt`.
+ *
+ * @param {{ storeHash: string, channelId?: number, itemType?: string, queuedAt?: number }} data
  */
 const auditJobId = (type, data) => {
-  const suffix = data.channelId ?? data.itemType ?? data.auditIds?.[0];
+  const suffix = data.channelId ?? data.itemType ?? data.queuedAt;
   return [type, data.storeHash, suffix].filter((part) => part !== undefined).join('_');
 };
 
+// A failed job is retried after 30 s, then 60 s (PHP: $tries = 1, so a network blip or a
+// BigCommerce 429 left the rows at status 1 and the dashboard on "Audit in progress").
+// Safe to repeat: item jobs skip audited items, home uses findOrCreate, scrape replaces old issues.
+const AUDIT_JOB_ATTEMPTS = 3;
+const AUDIT_RETRY_DELAY_MS = 30000;
+
 /**
- * Options for every seo-audit job (PHP Seoaudit: $tries = 1). Finished jobs are removed so the
- * same id can be queued again (a kept failed job would block its id; the worker logs failures).
+ * Options for every seo-audit job. Finished jobs are removed so the same id can be queued
+ * again (a kept failed job would block its id; the worker logs failures).
  */
 const auditJobOptions = (type, data) => ({
   jobId: auditJobId(type, data),
-  attempts: 1,
+  attempts: AUDIT_JOB_ATTEMPTS,
+  backoff: { type: 'exponential', delay: AUDIT_RETRY_DELAY_MS },
   removeOnComplete: true,
   removeOnFail: true,
 });

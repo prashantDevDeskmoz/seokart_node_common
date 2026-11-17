@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const http = require('http');
 const https = require('https');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -18,7 +19,14 @@ const REQUEST_HEADERS = {
   Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
 };
-const insecureAgent = new https.Agent({ rejectUnauthorized: false }); // PHP Guzzle verify => false
+// Keep-alive: links of the same host reuse the connection (no new TLS handshake per link).
+// maxSockets: at most this many open connections per host, so one storefront is not flooded.
+const MAX_SOCKETS_PER_HOST = 5;
+const keepAliveAgent = new http.Agent({ keepAlive: true, maxSockets: MAX_SOCKETS_PER_HOST });
+const insecureAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: true, maxSockets: MAX_SOCKETS_PER_HOST }); // PHP Guzzle verify => false
+const NOT_BROKEN_STATUSES = new Set([403, 429]); // bot protection / rate limit, not a missing page
+const MAX_RETRY_AFTER_MS = 10000;
+const DEFAULT_RETRY_AFTER_MS = 2000;
 const typoByDictionary = new Map();
 
 /**
@@ -97,6 +105,7 @@ const httpGet = async (url) => {
       maxRedirects: 5,
       validateStatus: () => true,
       headers: REQUEST_HEADERS,
+      httpAgent: keepAliveAgent,
       httpsAgent: insecureAgent,
       responseType: 'text',
     });
@@ -104,6 +113,52 @@ const httpGet = async (url) => {
   } catch (_err) {
     return { status: 404, body: '' };
   }
+};
+
+/**
+ * One HEAD / GET request of a link, status only: the body is never downloaded
+ * (GET body is dropped, HEAD has none). Never throws: a network error is 404 (like httpGet).
+ *
+ * @returns {Promise<{ status: number, retryAfter?: string }>}
+ */
+const requestStatus = async (url, method) => {
+  try {
+    const response = await axios.request({
+      url,
+      method,
+      timeout: HTTP_TIMEOUT_MS,
+      maxRedirects: 5,
+      validateStatus: () => true,
+      headers: REQUEST_HEADERS,
+      httpAgent: keepAliveAgent,
+      httpsAgent: insecureAgent,
+      responseType: 'stream',
+    });
+    // GET: close the stream without reading the page; HEAD: empty body, drain it so the socket is reused
+    if (method === 'get') response.data.destroy();
+    else response.data.resume();
+    return { status: Number(response.status) || 404, retryAfter: response.headers?.['retry-after'] };
+  } catch (_err) {
+    return { status: 404 };
+  }
+};
+
+/**
+ * Status of a link for the broken-link check (PHP pageStatus downloaded every page with GET):
+ *  - HEAD first; GET only when HEAD gets >= 400, because some servers refuse HEAD
+ *  - 429 (rate limited): wait Retry-After (default 2 s, max 10 s) and try one more time
+ *
+ * @returns {Promise<number>}
+ */
+const linkStatus = async (url) => {
+  let result = await requestStatus(url, 'head');
+  if (result.status >= 400) result = await requestStatus(url, 'get');
+  if (result.status === 429) {
+    const waitMs = Math.min(Number(result.retryAfter) * 1000 || DEFAULT_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    result = await requestStatus(url, 'get');
+  }
+  return result.status;
 };
 
 /**
@@ -129,16 +184,22 @@ const readHomePage = (html) => {
  * Every link is requested once per job (`statusByLink` cache, shared by all items of a job)
  * and at most LINK_CHECK_CONCURRENCY at a time; PHP requested the same link again for every
  * item, one by one. Links in `knownLinks` (seo_links_bigc) are not requested again.
- * Broken rule (same as the Node item editor): internal link >= 400, external link 404/410/5xx.
+ * Broken rule (same as the Node item editor): internal link >= 400, external link 404/410/5xx;
+ * 403 / 429 are never broken (bot protection / rate limit). Status comes from linkStatus (HEAD first).
  *
  * @param {string} html
  * @param {string} domain - store domain without protocol
- * @param {{ knownLinks?: Set<string>, statusByLink?: Map<string, Promise<number>> }} [cache]
+ * `linkCache` (optional, the worker passes a Redis one) keeps statuses between jobs:
+ * get(links) -> Map<link, status> of the cached ones, set(Map<link, status>) after the checks.
+ *
+ * @param {{ knownLinks?: Set<string>, statusByLink?: Map<string, Promise<number>>,
+ *   linkCache?: { get: (links: string[]) => Promise<Map<string, number>>,
+ *     set: (statusByLink: Map<string, number>) => Promise<void> } }} [cache]
  * @returns {Promise<{ internalLink: number, externalLink: number,
  *   brokenLinks: {type: number, link: string, text: string}[], httpLinks: {link: string, text: string}[],
  *   okLinks: string[] }>}
  */
-const scanLinks = async (html, domain, { knownLinks = new Set(), statusByLink = new Map() } = {}) => {
+const scanLinks = async (html, domain, { knownLinks = new Set(), statusByLink = new Map(), linkCache } = {}) => {
   const $ = cheerio.load(String(html || '').replaceAll('%%GLOBAL_ShopPathSSL%%', `https://${domain}`));
   const lowerDomain = String(domain || '').toLowerCase();
 
@@ -165,19 +226,34 @@ const scanLinks = async (html, domain, { knownLinks = new Set(), statusByLink = 
     if (!lowerLink.includes('https')) httpLinks.push({ link, text });
   });
 
+  // statuses found by earlier jobs (worker: Redis), so a link is not requested again in every batch
+  const uncheckedLinks = [...new Set(linksToCheck.map((item) => item.link))].filter((link) => !statusByLink.has(link));
+  const cachedStatus = linkCache && uncheckedLinks.length ? await linkCache.get(uncheckedLinks) : new Map();
+  cachedStatus.forEach((status, link) => statusByLink.set(link, Promise.resolve(status)));
+
   for (let start = 0; start < linksToCheck.length; start += LINK_CHECK_CONCURRENCY) {
     await Promise.all(
       linksToCheck.slice(start, start + LINK_CHECK_CONCURRENCY).map(async (item) => {
         if (!statusByLink.has(item.link)) {
-          statusByLink.set(item.link, httpGet(item.link).then((result) => result.status));
+          statusByLink.set(item.link, linkStatus(item.link));
         }
         item.status = await statusByLink.get(item.link);
       })
     );
   }
 
+  if (linkCache) {
+    const requestedLinks = new Set(uncheckedLinks.filter((link) => !cachedStatus.has(link)));
+    const newStatus = new Map(
+      linksToCheck.filter((item) => requestedLinks.has(item.link)).map((item) => [item.link, item.status])
+    );
+    if (newStatus.size) await linkCache.set(newStatus);
+  }
+
+  // 403 / 429 after the retry = the site blocked or rate-limited us, not a missing page
   const isBroken = (item) =>
-    item.isInternal ? item.status >= 400 : EXTERNAL_BROKEN_STATUSES.has(item.status);
+    !NOT_BROKEN_STATUSES.has(item.status) &&
+    (item.isInternal ? item.status >= 400 : EXTERNAL_BROKEN_STATUSES.has(item.status));
 
   return {
     internalLink,
