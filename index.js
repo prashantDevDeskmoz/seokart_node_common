@@ -1,6 +1,8 @@
 'use strict';
+const add = (a, b) => a + b;
 
 module.exports = {
-  models: require('./models'),
-  queues: require('./queues/names'),
+  add,
+  ...require('./models'),
+  ...require('./services/seoCopilot'),
 };

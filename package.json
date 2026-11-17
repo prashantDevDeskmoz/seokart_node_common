@@ -9,7 +9,7 @@
     "index.js",
     "models",
     "utils",
-    "queues"
+    "services"
   ],
   "dependencies": {
     "sequelize": "^6.37.8",
