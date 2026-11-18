@@ -47,7 +47,7 @@ const parseImageSetting = (raw) => {
  * @param {object} params.setting - parsed imgopt_setting.setting
  * @param {object|null} params.productData - result of getProductTemplateData
  * @param {boolean} [params.skipAiAlt=false] - alt was already generated (SEO Copilot)
- * @param {() => Promise<{ altText?: string, creditsExhausted?: boolean }>} [params.generateAiAlt]
+ * @param {(productData: object|null) => Promise<{ altText?: string, creditsExhausted?: boolean }>} [params.generateAiAlt]
  * @returns {Promise<{
  *   fileNameStatus: number, altStatus: number, fileSizeStatus: number,
  *   fileName: string, altText: string, imgQuality: string, convertPngToJpg: number,
@@ -69,7 +69,8 @@ const resolveImageSetting = async ({ setting, productData, skipAiAlt = false, ge
   if (altStatus && !skipAiAlt) {
     if (typeof generateAiAlt === 'function') {
       try {
-        const aiResult = await generateAiAlt();
+        // product data (brand / category) is passed so the AI call does not load it again
+        const aiResult = await generateAiAlt(productData);
         aiCreditsExhausted = Boolean(aiResult?.creditsExhausted);
         altText = String(aiResult?.altText || '').trim();
       } catch (err) {

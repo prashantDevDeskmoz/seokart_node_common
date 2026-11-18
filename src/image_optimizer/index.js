@@ -11,4 +11,5 @@ module.exports = {
   ...require('./localOriginal'),
   ...require('./optimizeProductImage'),
   ...require('./restoreProductImage'),
+  ...require('./aiAlt'),
 };
